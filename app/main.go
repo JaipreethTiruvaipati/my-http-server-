@@ -42,23 +42,22 @@ func main() {
 		
 		// 4. Concurrency (Goroutines)
 		// The 'go' keyword spawns a lightweight thread.
-		// This allows the main loop to immediately go back to waiting for the NEXT user,
-		// while 'handleConnection' deals with the CURRENT user in the background.
+		// This allows the main loop to immediately go back to waiting for the NEXT user.
 		go handleConnection(conn, *dir)
 	}
 }
 
 // handleConnection manages the lifecycle of a single TCP connection.
-// It supports Persistent Connections (Keep-Alive) by looping until the client disconnects.
+// It supports Persistent Connections (Keep-Alive) and Explicit Closures.
 func handleConnection(conn net.Conn, dir string) {
 	// Ensure the connection is closed when this function finally returns.
 	defer conn.Close()
 
 	// --- PERSISTENT CONNECTION LOOP ---
-	// HTTP/1.1 connections stay open by default to handle multiple requests sequentially.
+	// HTTP/1.1 connections stay open by default unless "Connection: close" is sent.
 	for {
 		// 1. Read Request Data
-		// We allocate a 1KB buffer. For a production server, we would need dynamic buffering.
+		// We allocate a 1KB buffer.
 		buf := make([]byte, 1024)
 		
 		n, err := conn.Read(buf)
@@ -77,15 +76,10 @@ func handleConnection(conn net.Conn, dir string) {
 			break
 		}
 
-		// Convert the buffer to a string for parsing.
-		// Note: We only convert buf[:n] to avoid reading empty garbage data at the end.
 		request := string(buf[:n])
 		
 		// 2. Parse the Request Line
-		// HTTP requests use CRLF (\r\n) to separate lines.
 		lines := strings.Split(request, "\r\n")
-		
-		// The first line (Request Line) looks like: "GET /index.html HTTP/1.1"
 		requestLine := strings.Split(lines[0], " ")
 		
 		if len(requestLine) < 2 {
@@ -95,12 +89,28 @@ func handleConnection(conn net.Conn, dir string) {
 		method := requestLine[0] // e.g., "GET", "POST"
 		path := requestLine[1]   // e.g., "/", "/echo/abc"
 
+		// --- CHECK FOR CONNECTION: CLOSE HEADER ---
+		// We scan the headers to see if the client wants to close the connection after this request.
+		shouldClose := false
+		for _, line := range lines {
+			// We check for the header. In a real server, we would use case-insensitive matching.
+			if strings.HasPrefix(line, "Connection: close") {
+				shouldClose = true
+				break
+			}
+		}
+
 		// 3. Routing Logic
 		// We route the request based on the path.
 
 		if path == "/" {
 			// --- ROOT ENDPOINT ---
-			conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+			// If we need to close, we explicitly add the Connection header.
+			if shouldClose {
+				conn.Write([]byte("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"))
+			} else {
+				conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+			}
 
 		} else if strings.HasPrefix(path, "/echo/") {
 			// --- ECHO ENDPOINT (With GZIP) ---
@@ -143,6 +153,11 @@ func handleConnection(conn net.Conn, dir string) {
 				headerLines = append(headerLines, "Content-Encoding: gzip")
 			}
 
+			// ADDED: If the client asked to close, echo that back in the headers
+			if shouldClose {
+				headerLines = append(headerLines, "Connection: close")
+			}
+
 			// Join headers and body with CRLFs
 			responseHeaders := strings.Join(headerLines, "\r\n")
 			response := responseHeaders + "\r\n\r\n" + finalBody
@@ -162,34 +177,49 @@ func handleConnection(conn net.Conn, dir string) {
 			}
 			
 			length := len(userAgent)
-			response := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", length, userAgent)
+			
+			// Construct Headers manually to include Connection: close if needed
+			headerLines := []string{
+				"HTTP/1.1 200 OK",
+				"Content-Type: text/plain",
+				fmt.Sprintf("Content-Length: %d", length),
+			}
+
+			if shouldClose {
+				headerLines = append(headerLines, "Connection: close")
+			}
+
+			responseHeaders := strings.Join(headerLines, "\r\n")
+			response := responseHeaders + "\r\n\r\n" + userAgent
 			conn.Write([]byte(response))
 
 		} else if strings.HasPrefix(path, "/files/") {
 			// --- FILE HANDLING ENDPOINT ---
 			
 			fileName := strings.TrimPrefix(path, "/files/")
-			// filepath.Join handles OS-specific separators (Slash vs Backslash)
 			fullPath := filepath.Join(dir, fileName)
 
 			if method == "POST" {
 				// --- POST: CREATE FILE ---
 				
-				// Extract Body: split request by the double CRLF delimiter
 				parts := strings.Split(request, "\r\n\r\n")
 				if len(parts) < 2 {
 					conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
-					continue
+					// Even on error, we respect the close header logic below
+				} else {
+					fileContent := parts[1]
+					err := os.WriteFile(fullPath, []byte(fileContent), 0644)
+					if err != nil {
+						conn.Write([]byte("HTTP/1.1 500 Internal Server Error\r\n\r\n"))
+					} else {
+						// Success response
+						if shouldClose {
+							conn.Write([]byte("HTTP/1.1 201 Created\r\nConnection: close\r\n\r\n"))
+						} else {
+							conn.Write([]byte("HTTP/1.1 201 Created\r\n\r\n"))
+						}
+					}
 				}
-				fileContent := parts[1]
-				
-				// Write data to disk (0644 = Read/Write permission)
-				err := os.WriteFile(fullPath, []byte(fileContent), 0644)
-				if err != nil {
-					conn.Write([]byte("HTTP/1.1 500 Internal Server Error\r\n\r\n"))
-					continue
-				}
-				conn.Write([]byte("HTTP/1.1 201 Created\r\n\r\n"))
 
 			} else {
 				// --- GET: READ FILE ---
@@ -197,16 +227,35 @@ func handleConnection(conn net.Conn, dir string) {
 				fileData, err := os.ReadFile(fullPath)
 				if err != nil {
 					conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
-					continue
+				} else {
+					length := len(fileData)
+					
+					headerLines := []string{
+						"HTTP/1.1 200 OK",
+						"Content-Type: application/octet-stream",
+						fmt.Sprintf("Content-Length: %d", length),
+					}
+					
+					if shouldClose {
+						headerLines = append(headerLines, "Connection: close")
+					}
+
+					responseHeaders := strings.Join(headerLines, "\r\n")
+					response := responseHeaders + "\r\n\r\n" + string(fileData)
+					conn.Write([]byte(response))
 				}
-				length := len(fileData)
-				response := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\n\r\n%s", length, string(fileData))
-				conn.Write([]byte(response))
 			}
 
 		} else {
 			// --- 404 CATCH-ALL ---
 			conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
+		}
+
+		// --- FINAL STEP: CHECK IF WE SHOULD CLOSE ---
+		// If the "Connection: close" header was present, we break the loop.
+		// This allows 'defer conn.Close()' to run, effectively hanging up the phone.
+		if shouldClose {
+			break
 		}
 	}
 }
