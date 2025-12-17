@@ -1,261 +1,267 @@
 package main
 
 import (
-	"bytes"         // Used to manipulate byte buffers (for compression)
-	"compress/gzip" // Used to compress data using the GZIP algorithm
-	"flag"          // Used to parse command-line arguments (flags)
-	"fmt"           // Used for formatted I/O (printing to console)
-	"io"            // Used to handle input/output errors like EOF
-	"net"           // Used for network I/O (TCP sockets)
-	"os"            // Used for operating system functionality (File I/O, Exit)
-	"path/filepath" // Used to construct file paths safely across OSs
-	"strings"       // Used for string manipulation (splitting, prefix checks)
+	"bytes"
+	"compress/gzip"
+	"flag"
+	"fmt"
+	"io"
+	"net"
+	"os"
+	"path/filepath"
+	"strings"
 )
 
+// --- 1. CORE TYPES ---
+
+// HTTPRequest helps us pass parsed data around easily (Decoupling)
+type HTTPRequest struct {
+	Method  string
+	Path    string
+	Headers map[string]string
+	Body    string
+}
+
+// HandlerFunc defines the shape of function our Router can call.
+// It takes the connection, the parsed request, and the config (dir).
+type HandlerFunc func(conn net.Conn, req HTTPRequest, dir string)
+
+// Route represents a single path mapping
+type Route struct {
+	Method  string
+	Path    string
+	Handler HandlerFunc
+	IsPrefix bool // If true, matches "/path/..." instead of exact "/path"
+}
+
+// Router manages the list of routes and finds the right handler
+type Router struct {
+	routes []Route
+}
+
+// NewRouter creates a ready-to-use router
+func NewRouter() *Router {
+	return &Router{routes: []Route{}}
+}
+
+// Register adds a new route to the list
+func (r *Router) Register(method, path string, handler HandlerFunc) {
+	// Simple logic: if path ends in slash, treat as prefix match (e.g., /echo/)
+	isPrefix := strings.HasSuffix(path, "/")
+	r.routes = append(r.routes, Route{
+		Method:   method,
+		Path:     path,
+		Handler:  handler,
+		IsPrefix: isPrefix,
+	})
+}
+
+// Helper methods for cleaner registration
+func (r *Router) Get(path string, handler HandlerFunc) {
+	r.Register("GET", path, handler)
+}
+func (r *Router) Post(path string, handler HandlerFunc) {
+	r.Register("POST", path, handler)
+}
+
+// ServeRequest is the "Receptionist": checks the path and calls the right Handler
+func (r *Router) ServeRequest(conn net.Conn, req HTTPRequest, dir string) {
+	for _, route := range r.routes {
+		matches := false
+		
+		if route.Method != req.Method {
+			continue
+		}
+
+		if route.IsPrefix {
+			if strings.HasPrefix(req.Path, route.Path) {
+				matches = true
+			}
+		} else {
+			if req.Path == route.Path {
+				matches = true
+			}
+		}
+
+		if matches {
+			route.Handler(conn, req, dir)
+			return
+		}
+	}
+
+	// 404 Catch-all
+	sendResponse(conn, "404 Not Found", nil, "", req)
+}
+
+// --- 2. HANDLERS (The "Specialists") ---
+
+func rootHandler(conn net.Conn, req HTTPRequest, dir string) {
+	sendResponse(conn, "200 OK", nil, "", req)
+}
+
+func echoHandler(conn net.Conn, req HTTPRequest, dir string) {
+	content := strings.TrimPrefix(req.Path, "/echo/")
+	
+	// Check for GZIP support
+	encoding := req.Headers["Accept-Encoding"]
+	shouldCompress := strings.Contains(encoding, "gzip")
+	
+	finalBody := content
+	extraHeaders := make(map[string]string)
+	extraHeaders["Content-Type"] = "text/plain"
+
+	if shouldCompress {
+		var b bytes.Buffer
+		w := gzip.NewWriter(&b)
+		w.Write([]byte(content))
+		w.Close()
+		finalBody = b.String()
+		extraHeaders["Content-Encoding"] = "gzip"
+	}
+
+	sendResponse(conn, "200 OK", extraHeaders, finalBody, req)
+}
+
+func userAgentHandler(conn net.Conn, req HTTPRequest, dir string) {
+	agent := req.Headers["User-Agent"]
+	headers := map[string]string{"Content-Type": "text/plain"}
+	sendResponse(conn, "200 OK", headers, agent, req)
+}
+
+func getFileHandler(conn net.Conn, req HTTPRequest, dir string) {
+	fileName := strings.TrimPrefix(req.Path, "/files/")
+	fullPath := filepath.Join(dir, fileName)
+
+	fileData, err := os.ReadFile(fullPath)
+	if err != nil {
+		sendResponse(conn, "404 Not Found", nil, "", req)
+		return
+	}
+
+	headers := map[string]string{"Content-Type": "application/octet-stream"}
+	sendResponse(conn, "200 OK", headers, string(fileData), req)
+}
+
+func createFileHandler(conn net.Conn, req HTTPRequest, dir string) {
+	fileName := strings.TrimPrefix(req.Path, "/files/")
+	fullPath := filepath.Join(dir, fileName)
+
+	err := os.WriteFile(fullPath, []byte(req.Body), 0644)
+	if err != nil {
+		sendResponse(conn, "500 Internal Server Error", nil, "", req)
+		return
+	}
+	sendResponse(conn, "201 Created", nil, "", req)
+}
+
+// --- 3. MAIN SERVER LOGIC ---
+
 func main() {
-	// 1. Parse Command Line Flags
-	// The user can start the server with: ./server --directory /tmp/
-	// If the flag isn't provided, it defaults to "." (current directory).
 	dir := flag.String("directory", ".", "Directory to serve files from")
 	flag.Parse()
 
-	fmt.Println("Logs from your program will appear here!")
+	// Initialize Router
+	router := NewRouter()
+	
+	// Register Routes (Dynamic Registration)
+	router.Get("/", rootHandler)
+	router.Get("/echo/", echoHandler)       // Ends with / -> Prefix match
+	router.Get("/user-agent", userAgentHandler)
+	router.Get("/files/", getFileHandler)
+	router.Post("/files/", createFileHandler)
 
-	// 2. Create the TCP Listener
-	// We bind to 0.0.0.0 (all interfaces) on port 4221.
+	fmt.Println("Server running on port 4221...")
+	
 	l, err := net.Listen("tcp", "0.0.0.0:4221")
 	if err != nil {
 		fmt.Println("Failed to bind to port 4221")
 		os.Exit(1)
 	}
-	// 'defer' ensures the listener is closed if the main function exits unexpectedly.
 	defer l.Close()
 
-	// 3. The Main Connection Loop
-	// This loop runs forever, waiting for new users to connect.
 	for {
 		conn, err := l.Accept()
 		if err != nil {
-			fmt.Println("Error accepting connection: ", err.Error())
 			continue
 		}
-		
-		// 4. Concurrency (Goroutines)
-		// The 'go' keyword spawns a lightweight thread.
-		// This allows the main loop to immediately go back to waiting for the NEXT user.
-		go handleConnection(conn, *dir)
+		go handleConnection(conn, router, *dir)
 	}
 }
 
-// handleConnection manages the lifecycle of a single TCP connection.
-// It supports Persistent Connections (Keep-Alive) and Explicit Closures.
-func handleConnection(conn net.Conn, dir string) {
-	// Ensure the connection is closed when this function finally returns.
+// handleConnection: Reads raw bytes, parses them, and delegates to Router
+func handleConnection(conn net.Conn, router *Router, dir string) {
 	defer conn.Close()
 
-	// --- PERSISTENT CONNECTION LOOP ---
-	// HTTP/1.1 connections stay open by default unless "Connection: close" is sent.
 	for {
-		// 1. Read Request Data
-		// We allocate a 1KB buffer.
+		// 1. Read Request
 		buf := make([]byte, 1024)
-		
 		n, err := conn.Read(buf)
+		if err == io.EOF || n == 0 { break }
+		if err != nil { break }
+
+		rawRequest := string(buf[:n])
 		
-		// Handle Disconnection:
-		// io.EOF means the client (browser/curl) has closed the connection cleanly.
-		if err == io.EOF {
-			break // Exit the loop to close the connection
-		}
-		if err != nil {
-			fmt.Println("Error reading request:", err)
-			break
-		}
-		// If 0 bytes were read, the connection is effectively dead.
-		if n == 0 {
-			break
-		}
+		// 2. Parse Request
+		req, isValid := parseRequest(rawRequest)
+		if !isValid { continue }
 
-		request := string(buf[:n])
-		
-		// 2. Parse the Request Line
-		lines := strings.Split(request, "\r\n")
-		requestLine := strings.Split(lines[0], " ")
-		
-		if len(requestLine) < 2 {
-			continue // Skip malformed requests
-		}
-		
-		method := requestLine[0] // e.g., "GET", "POST"
-		path := requestLine[1]   // e.g., "/", "/echo/abc"
+		// 3. Delegate to Router
+		router.ServeRequest(conn, req, dir)
 
-		// --- CHECK FOR CONNECTION: CLOSE HEADER ---
-		// We scan the headers to see if the client wants to close the connection after this request.
-		shouldClose := false
-		for _, line := range lines {
-			// We check for the header. In a real server, we would use case-insensitive matching.
-			if strings.HasPrefix(line, "Connection: close") {
-				shouldClose = true
-				break
-			}
-		}
-
-		// 3. Routing Logic
-		// We route the request based on the path.
-
-		if path == "/" {
-			// --- ROOT ENDPOINT ---
-			// If we need to close, we explicitly add the Connection header.
-			if shouldClose {
-				conn.Write([]byte("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"))
-			} else {
-				conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
-			}
-
-		} else if strings.HasPrefix(path, "/echo/") {
-			// --- ECHO ENDPOINT (With GZIP) ---
-			
-			content := strings.TrimPrefix(path, "/echo/")
-			
-			// Compression Logic
-			finalBody := content
-			shouldCompress := false
-			
-			// Check headers for 'Accept-Encoding: gzip'
-			for _, line := range lines {
-				if strings.HasPrefix(line, "Accept-Encoding: ") {
-					value := strings.TrimPrefix(line, "Accept-Encoding: ")
-					if strings.Contains(value, "gzip") {
-						shouldCompress = true
-						break
-					}
-				}
-			}
-
-			// If client supports gzip, compress the body
-			if shouldCompress {
-				var b bytes.Buffer
-				w := gzip.NewWriter(&b)
-				w.Write([]byte(content))
-				w.Close() // Must close to write the Gzip footer/checksum
-				finalBody = b.String()
-			}
-
-			// Construct Headers
-			headerLines := []string{
-				"HTTP/1.1 200 OK",
-				"Content-Type: text/plain",
-				// Content-Length matches the size of the body (compressed or not)
-				fmt.Sprintf("Content-Length: %d", len(finalBody)),
-			}
-
-			if shouldCompress {
-				headerLines = append(headerLines, "Content-Encoding: gzip")
-			}
-
-			// ADDED: If the client asked to close, echo that back in the headers
-			if shouldClose {
-				headerLines = append(headerLines, "Connection: close")
-			}
-
-			// Join headers and body with CRLFs
-			responseHeaders := strings.Join(headerLines, "\r\n")
-			response := responseHeaders + "\r\n\r\n" + finalBody
-			
-			conn.Write([]byte(response))
-
-		} else if path == "/user-agent" {
-			// --- USER-AGENT ENDPOINT ---
-			
-			var userAgent string
-			// Scan headers to find User-Agent
-			for _, line := range lines {
-				if strings.HasPrefix(line, "User-Agent: ") {
-					userAgent = strings.TrimPrefix(line, "User-Agent: ")
-					break
-				}
-			}
-			
-			length := len(userAgent)
-			
-			// Construct Headers manually to include Connection: close if needed
-			headerLines := []string{
-				"HTTP/1.1 200 OK",
-				"Content-Type: text/plain",
-				fmt.Sprintf("Content-Length: %d", length),
-			}
-
-			if shouldClose {
-				headerLines = append(headerLines, "Connection: close")
-			}
-
-			responseHeaders := strings.Join(headerLines, "\r\n")
-			response := responseHeaders + "\r\n\r\n" + userAgent
-			conn.Write([]byte(response))
-
-		} else if strings.HasPrefix(path, "/files/") {
-			// --- FILE HANDLING ENDPOINT ---
-			
-			fileName := strings.TrimPrefix(path, "/files/")
-			fullPath := filepath.Join(dir, fileName)
-
-			if method == "POST" {
-				// --- POST: CREATE FILE ---
-				
-				parts := strings.Split(request, "\r\n\r\n")
-				if len(parts) < 2 {
-					conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
-					// Even on error, we respect the close header logic below
-				} else {
-					fileContent := parts[1]
-					err := os.WriteFile(fullPath, []byte(fileContent), 0644)
-					if err != nil {
-						conn.Write([]byte("HTTP/1.1 500 Internal Server Error\r\n\r\n"))
-					} else {
-						// Success response
-						if shouldClose {
-							conn.Write([]byte("HTTP/1.1 201 Created\r\nConnection: close\r\n\r\n"))
-						} else {
-							conn.Write([]byte("HTTP/1.1 201 Created\r\n\r\n"))
-						}
-					}
-				}
-
-			} else {
-				// --- GET: READ FILE ---
-				
-				fileData, err := os.ReadFile(fullPath)
-				if err != nil {
-					conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
-				} else {
-					length := len(fileData)
-					
-					headerLines := []string{
-						"HTTP/1.1 200 OK",
-						"Content-Type: application/octet-stream",
-						fmt.Sprintf("Content-Length: %d", length),
-					}
-					
-					if shouldClose {
-						headerLines = append(headerLines, "Connection: close")
-					}
-
-					responseHeaders := strings.Join(headerLines, "\r\n")
-					response := responseHeaders + "\r\n\r\n" + string(fileData)
-					conn.Write([]byte(response))
-				}
-			}
-
-		} else {
-			// --- 404 CATCH-ALL ---
-			conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
-		}
-
-		// --- FINAL STEP: CHECK IF WE SHOULD CLOSE ---
-		// If the "Connection: close" header was present, we break the loop.
-		// This allows 'defer conn.Close()' to run, effectively hanging up the phone.
-		if shouldClose {
+		// 4. Handle "Connection: close"
+		if val, ok := req.Headers["Connection"]; ok && val == "close" {
 			break
 		}
 	}
+}
+
+// --- 4. HELPERS ---
+
+func parseRequest(raw string) (HTTPRequest, bool) {
+	parts := strings.Split(raw, "\r\n\r\n")
+	headerPart := parts[0]
+	body := ""
+	if len(parts) > 1 {
+		body = parts[1]
+	}
+
+	lines := strings.Split(headerPart, "\r\n")
+	requestLine := strings.Split(lines[0], " ")
+	if len(requestLine) < 2 {
+		return HTTPRequest{}, false
+	}
+
+	req := HTTPRequest{
+		Method:  requestLine[0],
+		Path:    requestLine[1],
+		Headers: make(map[string]string),
+		Body:    body,
+	}
+
+	for _, line := range lines[1:] {
+		if colonIdx := strings.Index(line, ": "); colonIdx != -1 {
+			key := line[:colonIdx]
+			val := line[colonIdx+2:]
+			req.Headers[key] = val
+		}
+	}
+	return req, true
+}
+
+func sendResponse(conn net.Conn, status string, headers map[string]string, body string, req HTTPRequest) {
+	response := []string{fmt.Sprintf("HTTP/1.1 %s", status)}
+	
+	for k, v := range headers {
+		response = append(response, fmt.Sprintf("%s: %s", k, v))
+	}
+	
+	response = append(response, fmt.Sprintf("Content-Length: %d", len(body)))
+	
+	// Echo connection header if strictly needed (Keep-Alive logic)
+	if val, ok := req.Headers["Connection"]; ok && val == "close" {
+		response = append(response, "Connection: close")
+	}
+	
+	finalResp := strings.Join(response, "\r\n") + "\r\n\r\n" + body
+	conn.Write([]byte(finalResp))
 }
