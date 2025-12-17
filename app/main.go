@@ -1,11 +1,13 @@
 package main
 
 import (
-	"flag" // Needed to parse command line flags like --directory
+	"bytes"         // Needed to hold binary data in memory
+	"compress/gzip" // Needed to perform the actual compression
+	"flag"
 	"fmt"
 	"net"
 	"os"
-	"path/filepath" // Needed to join paths safely
+	"path/filepath"
 	"strings"
 )
 
@@ -13,7 +15,6 @@ func main() {
 	fmt.Println("Logs from your program will appear here!")
 
 	// 1. Parse Command Line Flags
-	// This looks for --directory and stores the value in the variable 'dir'
 	// Example usage: ./server --directory /tmp/
 	dir := flag.String("directory", ".", "Directory to serve files from")
 	flag.Parse()
@@ -23,7 +24,6 @@ func main() {
 		fmt.Println("Failed to bind to port 4221")
 		os.Exit(1)
 	}
-	// Defer ensures the listener closes when main exits (good practice)
 	defer l.Close()
 
 	for {
@@ -33,18 +33,15 @@ func main() {
 			continue
 		}
 		
-		// CRITICAL CHANGE: The 'go' keyword makes this run in the background (Concurrency)
-		// Pass the directory value (*dir) to the handler
+		// Handle each connection in a new goroutine (Concurrency)
 		go handleConnection(conn, *dir)
 	}
 }
 
-// handleConnection processes an individual user request
 func handleConnection(conn net.Conn, dir string) {
 	defer conn.Close()
 
-	// 1. Read the Request into a buffer
-	// We create a buffer of 1024 bytes to hold the incoming data
+	// 1. Read the Request
 	buf := make([]byte, 1024)
 	n, err := conn.Read(buf)
 	if err != nil {
@@ -52,11 +49,9 @@ func handleConnection(conn net.Conn, dir string) {
 		return
 	}
 
-	// Convert the read bytes to a string for parsing
 	request := string(buf[:n])
 	
 	// 2. Parse Request Line
-	// We split by "\r\n" first to isolate the Request Line (Line 0) from Headers
 	lines := strings.Split(request, "\r\n")
 	requestLine := strings.Split(lines[0], " ")
 	
@@ -64,23 +59,76 @@ func handleConnection(conn net.Conn, dir string) {
 		return
 	}
 	
-	method := requestLine[0] // e.g., "GET" or "POST"
-	path := requestLine[1]   // e.g., "/files/foo" or "/index.html"
+	method := requestLine[0]
+	path := requestLine[1]
 
 	// 3. Routing Logic
 	if path == "/" {
 		conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
 
 	} else if strings.HasPrefix(path, "/echo/") {
+		// --- ECHO with GZIP COMPRESSION Logic ---
+		
+		// The original string content
 		content := strings.TrimPrefix(path, "/echo/")
-		length := len(content)
-		response := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", length, content)
+		
+		// Default: We assume no compression
+		finalBody := content
+		shouldCompress := false
+
+		// A. Check headers to see if client supports 'gzip'
+		for _, line := range lines {
+			if strings.HasPrefix(line, "Accept-Encoding: ") {
+				value := strings.TrimPrefix(line, "Accept-Encoding: ")
+				if strings.Contains(value, "gzip") {
+					shouldCompress = true
+					break
+				}
+			}
+		}
+
+		// B. Perform Compression if needed
+		if shouldCompress {
+			// 1. Create a buffer to hold the compressed bytes
+			var b bytes.Buffer
+			
+			// 2. Create a Gzip Writer that writes into that buffer
+			w := gzip.NewWriter(&b)
+			
+			// 3. Write the original content into the compressor
+			w.Write([]byte(content))
+			
+			// 4. CLOSE the writer. This is critical!
+			// If you don't close, the Gzip footer won't be written, and data is corrupt.
+			w.Close()
+			
+			// 5. Get the compressed string (Go strings can hold binary data)
+			finalBody = b.String()
+		}
+
+		// C. Prepare Headers
+		headerLines := []string{
+			"HTTP/1.1 200 OK",
+			"Content-Type: text/plain",
+			// IMPORTANT: Content-Length must be the length of the COMPRESSED data
+			fmt.Sprintf("Content-Length: %d", len(finalBody)),
+		}
+
+		// Add the Content-Encoding header if we actually compressed it
+		if shouldCompress {
+			headerLines = append(headerLines, "Content-Encoding: gzip")
+		}
+
+		// D. Send Response
+		responseHeaders := strings.Join(headerLines, "\r\n")
+		// \r\n\r\n separates headers from body
+		response := responseHeaders + "\r\n\r\n" + finalBody
+		
 		conn.Write([]byte(response))
 
 	} else if path == "/user-agent" {
 		// Extract User-Agent Header
 		var userAgent string
-		// Loop through all lines to find the header starting with "User-Agent:"
 		for _, line := range lines {
 			if strings.HasPrefix(line, "User-Agent: ") {
 				userAgent = strings.TrimPrefix(line, "User-Agent: ")
@@ -93,54 +141,33 @@ func handleConnection(conn net.Conn, dir string) {
 		conn.Write([]byte(response))
 
 	} else if strings.HasPrefix(path, "/files/") {
-		// Extract the filename from the URL
+		// --- FILE HANDLING Logic ---
 		fileName := strings.TrimPrefix(path, "/files/")
-		// Securely combine directory + filename
 		fullPath := filepath.Join(dir, fileName)
 
-		// CHECK: Are we READING a file (GET) or CREATING a file (POST)?
 		if method == "POST" {
-			// --- POST LOGIC START ---
-			
-			// 1. Find the Body
-			// The Body is separated from headers by a double CRLF ("\r\n\r\n")
+			// POST: Create/Write File
 			parts := strings.Split(request, "\r\n\r\n")
-			
-			// If we don't have a body part, just write an empty file or error out
 			if len(parts) < 2 {
 				conn.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
 				return
 			}
-			
-			// The body is the second part (Index 1)
 			fileContent := parts[1]
-
-			// Note: In a production server, we would check the 'Content-Length' header
-			// to know exactly how many bytes to read, but for this stage,
-			// trusting the split is usually sufficient for small files.
-
-			// 2. Write the file to disk
-			// 0644 is the permission code (Read/Write for owner, Read for others)
+			
 			err := os.WriteFile(fullPath, []byte(fileContent), 0644)
 			if err != nil {
 				conn.Write([]byte("HTTP/1.1 500 Internal Server Error\r\n\r\n"))
 				return
 			}
-
-			// 3. Respond with 201 Created
 			conn.Write([]byte("HTTP/1.1 201 Created\r\n\r\n"))
-			
-			// --- POST LOGIC END ---
 
 		} else {
-			// --- GET LOGIC (Existing) ---
-			
+			// GET: Read File
 			fileData, err := os.ReadFile(fullPath)
 			if err != nil {
 				conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
 				return
 			}
-
 			length := len(fileData)
 			response := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: %d\r\n\r\n%s", length, string(fileData))
 			conn.Write([]byte(response))
