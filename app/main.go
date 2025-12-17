@@ -54,7 +54,24 @@ func main() {
 		
 		conn.Write([]byte(response))
 
-	} else {
+	} else if path == "/user-agent" {
+		// 4. Extract User-Agent Header
+		var userAgent string
+		
+		// Loop through all lines to find the header starting with "User-Agent:"
+		for _, line := range lines {
+			if strings.HasPrefix(line, "User-Agent: ") {
+				// Cut off the "User-Agent: " part to get the value
+				userAgent = strings.TrimPrefix(line, "User-Agent: ")
+				break
+			}
+		}
+
+		length := len(userAgent)
+		response := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", length, userAgent)
+		conn.Write([]byte(response))
+
+	}else {
 		conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
 	}
 }
