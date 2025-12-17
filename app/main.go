@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"strings" // Imported for string manipulation
+	"strings" // Essential for processing the path
 )
 
 func main() {
@@ -21,37 +21,39 @@ func main() {
 		fmt.Println("Error accepting connection: ", err.Error())
 		os.Exit(1)
 	}
-	defer conn.Close() // Ensure connection closes when we are done
+	defer conn.Close()
 
-	// 1. Create a buffer to hold the incoming data
-	// 1024 bytes is usually enough for the request headers
+	// 1. Read the Request
 	buf := make([]byte, 1024)
-
-	// 2. Read the data from the connection into the buffer
 	n, err := conn.Read(buf)
 	if err != nil {
 		fmt.Println("Error reading request:", err)
 		return
 	}
 
-	// 3. Convert the read bytes to a string
+	// 2. Parse the Path
 	request := string(buf[:n])
-	
-	// 4. Parse the Request Line
-	// The Request Line is the first part: "GET /index.html HTTP/1.1"
-	// We split the string by spaces to get the parts
 	parts := strings.Split(request, " ")
-	
-	// Safety check to ensure the request is valid
 	if len(parts) < 2 {
-		return
+		return 
 	}
+	path := parts[1]
 
-	path := parts[1] // The path is the second element (Index 1)
-
-	// 5. Route based on the path
+	// 3. Routing Logic
 	if path == "/" {
 		conn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
+		
+	} else if strings.HasPrefix(path, "/echo/") {
+		// Extract the content after "/echo/"
+		content := strings.TrimPrefix(path, "/echo/")
+		length := len(content)
+
+		// Construct the headers and body using Sprintf
+		// %d inserts the integer length, %s inserts the string content
+		response := fmt.Sprintf("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n%s", length, content)
+		
+		conn.Write([]byte(response))
+
 	} else {
 		conn.Write([]byte("HTTP/1.1 404 Not Found\r\n\r\n"))
 	}
