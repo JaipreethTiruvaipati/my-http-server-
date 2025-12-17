@@ -25,7 +25,8 @@ func main() {
         
         // Handle connection in a separate function or block to keep main clean
         // For now, we keep it inline for simplicity
-		handleConnection(conn)
+		// CRITICAL CHANGE: The 'go' keyword makes this run in the background
+		go handleConnection(conn)
 	}
 }
 
