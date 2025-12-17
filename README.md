@@ -1,37 +1,35 @@
 [![progress-banner](https://backend.codecrafters.io/progress/http-server/d37e4781-e748-4b7a-98b4-d776c59513fa)](https://app.codecrafters.io/users/codecrafters-bot?r=2qF)
 
-This is a starting point for Go solutions to the
-["Build Your Own HTTP server" Challenge](https://app.codecrafters.io/courses/http-server/overview).
+# High-Performance HTTP Server in Go
 
-[HTTP](https://en.wikipedia.org/wiki/Hypertext_Transfer_Protocol) is the
-protocol that powers the web. In this challenge, you'll build a HTTP/1.1 server
-that is capable of serving multiple clients.
+A lightweight, multi-threaded HTTP/1.1 server built from scratch in Go. This project implements core HTTP protocol features including concurrent connection handling, dynamic routing, file persistence, compression, and connection management without relying on external web frameworks.
 
-Along the way you'll learn about TCP servers,
-[HTTP request syntax](https://www.w3.org/Protocols/rfc2616/rfc2616-sec5.html),
-and more.
+## 🚀 Features
 
-**Note**: If you're viewing this repo on GitHub, head over to
-[codecrafters.io](https://codecrafters.io) to try the challenge.
+* **Concurrency:** Handles multiple simultaneous clients using Go routines (green threads).
+* **Custom HTTP Parsing:** Manually parses HTTP Request lines, Headers, and Bodies from raw byte streams.
+* **Dynamic Routing:** Supports multiple endpoints (`/`, `/echo`, `/user-agent`, `/files`).
+* **File I/O:**
+    * `GET` requests to serve static files.
+    * `POST` requests to upload and save files to disk.
+    * Configurable storage directory via command-line flags.
+* **Compression:** Supports `gzip` compression for bandwidth optimization (Content Negotiation).
+* **Connection Management:**
+    * Implements **Persistent Connections (Keep-Alive)** by default for performance.
+    * Supports **Graceful Teardown** via the `Connection: close` header.
 
-# Passing the first stage
+## 🛠️ Tech Stack
 
-The entry point for your HTTP server implementation is in `app/main.go`. Study
-and uncomment the relevant code, and push your changes to pass the first stage:
+* **Language:** Go (Golang)
+* **Standard Libraries:** `net` (TCP), `io`, `os`, `compress/gzip`, `bytes`, `strings`, `flag`.
+* **Architecture:** TCP Listener -> Concurrent Goroutine Workers -> Request Parser -> Route Handler.
 
-```sh
-git commit -am "pass 1st stage" # any msg
-git push origin master
-```
+## 🏃‍♂️ Getting Started
 
-Time to move on to the next stage!
+### Prerequisites
+* Go 1.19+ installed.
 
-# Stage 2 & beyond
-
-Note: This section is for stages 2 and beyond.
-
-1. Ensure you have `go (1.25)` installed locally
-1. Run `./your_program.sh` to run your program, which is implemented in
-   `app/main.go`.
-1. Commit your changes and run `git push origin master` to submit your solution
-   to CodeCrafters. Test output will be streamed to your terminal.
+### Installation
+Clone the repository (or copy the code):
+```bash
+git clone [https://github.com/JaipreethTiruvaipati/my-http-server-](https://github.com/JaipreethTiruvaipati/my-http-server-)
